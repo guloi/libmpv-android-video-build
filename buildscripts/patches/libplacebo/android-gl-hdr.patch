@@ -1,0 +1,64 @@
+--- a/src/opengl/swapchain.c
++++ b/src/opengl/swapchain.c
+@@ -34,6 +34,12 @@
+     pl_tex fb;
+     bool frame_started;
+ 
++    // PiliNara: Android/EGL 没法通过平台 API 声明 HDR，改为由调用方
++    // （mpv 的 vo_gpu_next）用 pl_swapchain_colorspace_hint 告知要以什么
++    // 色彩空间编码输出；这里只保存，真正生效在 gl_sw_start_frame。
++    struct pl_color_space hint;
++    bool has_hint;
++
+     // vsync fences
+     int swapchain_depth;
+     PL_ARRAY(GLsync) vsync_fences;
+@@ -84,6 +90,21 @@
+ {
+     struct priv *p = PL_PRIV(sw);
+     return p->params.max_swapchain_depth;
++}
++
++static void gl_sw_colorspace_hint(pl_swapchain sw,
++                                  const struct pl_color_space *csp)
++{
++    struct priv *p = PL_PRIV(sw);
++
++    pl_mutex_lock(&p->lock);
++    if (csp) {
++        p->hint = *csp;
++        p->has_hint = true;
++    } else {
++        p->has_hint = false;
++    }
++    pl_mutex_unlock(&p->lock);
+ }
+ 
+ static bool gl_sw_resize(pl_swapchain sw, int *width, int *height)
+@@ -193,7 +214,7 @@
+                 .color_depth = p->fb->params.format->component_depth[0],
+             },
+         },
+-        .color_space = pl_color_space_monitor,
++        .color_space = p->has_hint ? p->hint : pl_color_space_monitor,
+     };
+ 
+     p->frame_started = gl_check_err(sw->gpu, "gl_sw_start_frame");
+@@ -269,10 +290,11 @@
+ }
+ 
+ static const struct pl_sw_fns opengl_swapchain = {
+-    .destroy      = gl_sw_destroy,
+-    .latency      = gl_sw_latency,
+-    .resize       = gl_sw_resize,
+-    .start_frame  = gl_sw_start_frame,
+-    .submit_frame = gl_sw_submit_frame,
+-    .swap_buffers = gl_sw_swap_buffers,
++    .destroy         = gl_sw_destroy,
++    .latency         = gl_sw_latency,
++    .colorspace_hint = gl_sw_colorspace_hint,
++    .resize          = gl_sw_resize,
++    .start_frame     = gl_sw_start_frame,
++    .submit_frame    = gl_sw_submit_frame,
++    .swap_buffers    = gl_sw_swap_buffers,
+ };
