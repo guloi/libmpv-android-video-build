@@ -1,10 +1,13 @@
+diff --git a/video/out/opengl/context_android.c b/video/out/opengl/context_android.c
+index 0a12cf8..ff511ee 100644
 --- a/video/out/opengl/context_android.c
 +++ b/video/out/opengl/context_android.c
-@@ -15,6 +15,11 @@
+@@ -15,6 +15,12 @@
   * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
   */
  
 +#include <dlfcn.h>
++#include <string.h>
 +
 +#include <android/data_space.h>
 +#include <android/native_window.h>
@@ -12,11 +15,10 @@
  #include <EGL/egl.h>
  #include <EGL/eglext.h>
  
-@@ -22,6 +27,86 @@
- #include "egl_helpers.h"
+@@ -23,6 +29,105 @@
  #include "common/common.h"
  #include "context.h"
-+
+ 
 +// PiliNara: Android/EGL（gpu-next + gpu-api=opengl）下的 HDR 输出。
 +//
 +// Vulkan WSI 在 Android 上只给线性（没压缩）缓冲，全屏/横屏需要旋转图层时
@@ -30,6 +32,18 @@
 +
 +#ifndef ADATASPACE_BT2020_PQ
 +#define ADATASPACE_BT2020_PQ 163971072
++#endif
++
++// eglCreateWindowSurface 的 EGL_GL_COLORSPACE_KHR 属性（EGL_EXT_gl_colorspace_bt2020_pq）。
++// 这一步很关键：EGL 驱动会给每次 eglSwapBuffers 入队的缓冲打上自己的 dataspace，
++// 只调 ANativeWindow_setBuffersDataSpace 的话会被 EGL 打回 sRGB，表现为
++// 「亮度对了但画面发灰」（PQ 数据被当 SDR 解释）。
++#ifndef EGL_GL_COLORSPACE_KHR
++#define EGL_GL_COLORSPACE_KHR 0x309D
++#endif
++
++#ifndef EGL_GL_COLORSPACE_BT2020_PQ_EXT
++#define EGL_GL_COLORSPACE_BT2020_PQ_EXT 0x3340
 +#endif
 +
 +// ANativeWindow_setBuffersDataSpace 是 API 28 才导出的符号，而 libmpv 以
@@ -65,6 +79,13 @@
 +    return pl_color_space_hdr10;
 +}
 +
++// EGL_EXT_gl_colorspace_bt2020_pq 是否可用（Adreno 一般有，部分 Mali 没有）。
++static bool android_gl_supports_bt2020pq(EGLDisplay display)
++{
++    const char *exts = eglQueryString(display, EGL_EXTENSIONS);
++    return exts && strstr(exts, "EGL_EXT_gl_colorspace_bt2020_pq");
++}
++
 +struct android_gl_cb {
 +    struct ra_ctx *ctx;
 +    EGLDisplay display;
@@ -96,10 +117,11 @@
 +    MP_WARN(cb->ctx, "Android/EGL: 没有 10bit 的 EGLConfig，HDR 退化成 8bit\n");
 +    return 0;
 +}
- 
++
  struct priv {
      struct GL gl;
-@@ -66,7 +151,14 @@
+     EGLDisplay egl_display;
+@@ -66,7 +171,14 @@ static bool android_init(struct ra_ctx *ctx)
      }
  
      EGLConfig config;
@@ -115,7 +137,7 @@
          goto fail;
  
      ANativeWindow *native_window = vo_android_native_window(ctx->vo);
-@@ -74,6 +166,13 @@
+@@ -74,8 +186,32 @@ static bool android_init(struct ra_ctx *ctx)
      eglGetConfigAttrib(p->egl_display, config, EGL_NATIVE_VISUAL_ID, &format);
      ANativeWindow_setBuffersGeometry(native_window, 0, 0, format);
  
@@ -126,10 +148,29 @@
 +        MP_VERBOSE(ctx, "Android/EGL: 以 10bit BT.2020/PQ 输出（HDR）\n");
 +    }
 +
++    const EGLint hdr_cs_attribs[] = {
++        EGL_GL_COLORSPACE_KHR, EGL_GL_COLORSPACE_BT2020_PQ_EXT,
++        EGL_NONE,
++    };
++    bool hdr_cs = android_gl_is_hdr(ctx) &&
++                  android_gl_supports_bt2020pq(p->egl_display);
      p->egl_surface = eglCreateWindowSurface(p->egl_display, config,
++                                    (EGLNativeWindowType)native_window,
++                                    hdr_cs ? hdr_cs_attribs : NULL);
++    if (p->egl_surface != EGL_NO_SURFACE && hdr_cs) {
++        MP_VERBOSE(ctx, "Android/EGL: 面色彩空间 = BT.2020/PQ"
++                   "（EGL_EXT_gl_colorspace_bt2020_pq）\n");
++    }
++    if (p->egl_surface == EGL_NO_SURFACE && hdr_cs) {
++        // 驱动声称支持但建面失败时退回默认色彩空间，至少能出画。
++        MP_WARN(ctx, "Android/EGL: 指定 BT.2020/PQ 色彩空间失败，退回默认\n");
++        p->egl_surface = eglCreateWindowSurface(p->egl_display, config,
                                      (EGLNativeWindowType)native_window, NULL);
++    }
  
-@@ -92,6 +191,7 @@
+     if (p->egl_surface == EGL_NO_SURFACE) {
+         MP_FATAL(ctx, "Could not create EGL surface!\n");
+@@ -92,6 +228,7 @@ static bool android_init(struct ra_ctx *ctx)
  
      struct ra_ctx_params params = {
          .swap_buffers = android_swap_buffers,
@@ -137,7 +178,7 @@
      };
  
      if (!ra_gl_ctx_init(ctx, &p->gl, params))
-@@ -114,6 +214,9 @@
+@@ -114,6 +251,9 @@ static bool android_reconfig(struct ra_ctx *ctx)
      if (native_window) {
          int32_t current_format = ANativeWindow_getFormat(native_window);
          ANativeWindow_setBuffersGeometry(native_window, w, h, current_format);
